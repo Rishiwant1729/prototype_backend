@@ -1,19 +1,16 @@
 require("dotenv").config();
-const db = require("../db");
+const prisma = require("../db/prisma");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN;
-// move to .env later
 
 exports.signup = async (name, email, password) => {
   // Allow only ONE admin
-  const [existing] = await db.execute(
-    `SELECT admin_id FROM admins`
-  );
+  const existingAdmin = await prisma.admin.findFirst();
 
-  if (existing.length > 0) {
+  if (existingAdmin) {
     return {
       action: "REJECTED",
       reason: "Admin already exists"
@@ -22,28 +19,26 @@ exports.signup = async (name, email, password) => {
 
   const passwordHash = await bcrypt.hash(password, 10);
 
-  await db.execute(
-    `INSERT INTO admins (name, email, password_hash)
-     VALUES (?, ?, ?)`,
-    [name, email, passwordHash]
-  );
+  await prisma.admin.create({
+    data: {
+      name,
+      email,
+      password_hash: passwordHash
+    }
+  });
 
   return { action: "ADMIN_CREATED" };
 };
 
 exports.login = async (email, password) => {
-  const [admins] = await db.execute(
-    `SELECT admin_id, name, password_hash
-     FROM admins
-     WHERE email = ?`,
-    [email]
-  );
+  const admin = await prisma.admin.findUnique({
+    where: { email }
+  });
 
-  if (admins.length === 0) {
+  if (!admin) {
     return { action: "REJECTED", reason: "Invalid credentials" };
   }
 
-  const admin = admins[0];
   const valid = await bcrypt.compare(password, admin.password_hash);
 
   if (!valid) {
@@ -51,17 +46,19 @@ exports.login = async (email, password) => {
   }
 
   const token = jwt.sign(
-  {
-    admin_id: admin.admin_id,
-    name: admin.name
-  },
-  JWT_SECRET,
-  { expiresIn: JWT_EXPIRES_IN }
-);
-
+    {
+      admin_id: admin.admin_id,
+      name: admin.name,
+      role: admin.role
+    },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
 
   return {
     action: "LOGIN_SUCCESS",
-    token
+    token,
+    role: admin.role,
+    name: admin.name
   };
 };

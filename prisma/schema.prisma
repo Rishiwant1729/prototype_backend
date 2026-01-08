@@ -1,0 +1,165 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Admin {
+  admin_id      Int       @id @default(autoincrement())
+  name          String    @db.VarChar(100)
+  email         String    @unique(map: "email") @db.VarChar(100)
+  password_hash String    @db.VarChar(255)
+  role          AdminRole @default(MANAGEMENT)
+  created_at    DateTime? @default(now()) @db.Timestamp(0)
+
+  @@map("admins")
+}
+
+enum AdminRole {
+  MANAGEMENT   // Full access to analytics, exports, scheduled reports
+  OPERATOR     // Sport room staff - issue/return flow + recent equipment list
+  GUARD        // Gate staff - occupancy-only view for assigned facility
+  AUDITOR      // Raw event logs and data retention settings
+}
+
+model Student {
+  student_id       String            @id @db.VarChar(20)
+  student_name     String            @db.VarChar(100)
+  program          String?           @db.VarChar(100)
+  admission_year   Int?
+  status           students_status?  @default(active)
+  created_at       DateTime?         @default(now()) @db.Timestamp(0)
+  equipmentIssues  EquipmentIssue[]
+  facilitySessions FacilitySession[]
+  rfidMappings     RfidMapping[]
+
+  @@map("students")
+}
+
+model RfidMapping {
+  uid        String               @id @db.VarChar(50)
+  student_id String               @db.VarChar(20)
+  status     rfid_mapping_status? @default(active)
+  mapped_at  DateTime?            @default(now()) @db.Timestamp(0)
+  remarks    String?              @db.VarChar(255)
+  student    Student              @relation(fields: [student_id], references: [student_id], onDelete: NoAction, onUpdate: NoAction, map: "rfid_mapping_ibfk_1")
+
+  @@index([uid], map: "idx_rfid_uid")
+  @@index([student_id], map: "student_id")
+  @@map("rfid_mapping")
+}
+
+model FacilitySession {
+  session_id       String                         @id @default(uuid()) @db.Char(36)
+  uid              String                         @db.VarChar(50)
+  student_id       String                         @db.VarChar(20)
+  facility_id      String                         @db.VarChar(30)
+  entry_time       DateTime                       @db.Timestamp(0)
+  exit_time        DateTime?                      @db.Timestamp(0)
+  exit_reason      facility_sessions_exit_reason?
+  duration_minutes Int?
+  created_at       DateTime?                      @default(now()) @db.Timestamp(0)
+  student          Student                        @relation(fields: [student_id], references: [student_id], onDelete: NoAction, onUpdate: NoAction, map: "facility_sessions_ibfk_1")
+  facility         facility_config                @relation(fields: [facility_id], references: [facility_id], onDelete: NoAction, onUpdate: NoAction, map: "facility_sessions_ibfk_2")
+
+  @@index([facility_id], map: "facility_id")
+  @@index([student_id, facility_id], map: "idx_facility_sessions_student")
+  @@map("facility_sessions")
+}
+
+model Equipment {
+  equipment_id      Int                 @id @default(autoincrement())
+  name              String              @db.VarChar(100)
+  category          String?             @db.VarChar(50)
+  created_at        DateTime?           @default(now()) @db.Timestamp(0)
+  facilityEquipment FacilityEquipment[]
+
+  @@map("equipment")
+}
+
+model FacilityEquipment {
+  facility_id        String          @db.VarChar(50)
+  equipment_id       Int
+  total_quantity     Int
+  available_quantity Int
+  facility           facility_config @relation(fields: [facility_id], references: [facility_id], onDelete: Cascade, onUpdate: NoAction, map: "facility_equipment_ibfk_1")
+  equipment          Equipment       @relation(fields: [equipment_id], references: [equipment_id], onDelete: Cascade, onUpdate: NoAction, map: "facility_equipment_ibfk_2")
+
+  @@id([facility_id, equipment_id])
+  @@index([equipment_id], map: "equipment_id")
+  @@map("facility_equipment")
+}
+
+model EquipmentIssue {
+  issue_id     String                   @id @default(uuid()) @db.Char(36)
+  uid          String                   @db.VarChar(50)
+  student_id   String                   @db.VarChar(20)
+  student_name String                   @db.VarChar(100)
+  status       equipment_issues_status? @default(ISSUED)
+  issued_at    DateTime                 @db.Timestamp(0)
+  returned_at  DateTime?                @db.Timestamp(0)
+  assistant_id String?                  @db.VarChar(50)
+  remarks      String?                  @db.VarChar(255)
+  items        EquipmentIssueItem[]
+  student      Student                  @relation(fields: [student_id], references: [student_id], onDelete: NoAction, onUpdate: NoAction, map: "equipment_issues_ibfk_1")
+
+  @@index([student_id], map: "idx_equipment_issues_student")
+  @@map("equipment_issues")
+}
+
+model EquipmentIssueItem {
+  item_id        String                        @id @default(uuid()) @db.Char(36)
+  issue_id       String                        @db.Char(36)
+  equipment_type String                        @db.VarChar(100)
+  issued_qty     Int
+  returned_qty   Int?                          @default(0)
+  status         equipment_issue_items_status? @default(ISSUED)
+  issue          EquipmentIssue                @relation(fields: [issue_id], references: [issue_id], onDelete: NoAction, onUpdate: NoAction, map: "equipment_issue_items_ibfk_1")
+
+  @@index([issue_id], map: "issue_id")
+  @@map("equipment_issue_items")
+}
+
+model facility_config {
+  facility_id          String              @id @db.VarChar(30)
+  facility_name        String              @db.VarChar(100)
+  max_duration_minutes Int
+  grace_window_minutes Int
+  active               Boolean?            @default(true)
+  equipment            FacilityEquipment[]
+  sessions             FacilitySession[]
+}
+
+enum rfid_mapping_status {
+  active
+  inactive
+}
+
+enum equipment_issues_status {
+  ISSUED
+  PARTIAL_RETURN
+  RETURNED
+}
+
+enum students_status {
+  active
+  graduated
+  inactive
+}
+
+enum equipment_issue_items_status {
+  ISSUED
+  PARTIAL_RETURN
+  RETURNED
+}
+
+enum facility_sessions_exit_reason {
+  NORMAL_SCAN
+  AUTO_TIMEOUT
+  AUTO_TIMEOUT_LATE_SCAN
+  IMPLICIT_EXIT
+  ADMIN_FIX
+}

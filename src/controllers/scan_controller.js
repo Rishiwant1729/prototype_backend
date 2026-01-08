@@ -22,3 +22,13 @@ exports.handleScan = async (req, res) => {
     });
   }
 };
+
+// exports.handleScan = async (req, res) => {
+//   console.log("📡 Incoming scan from ESP:");
+//   console.log(req.body);
+
+//   const { uid, facility } = req.body;
+
+//   const result = await scanService.processScan(uid, facility);
+//   res.json(result);
+// };

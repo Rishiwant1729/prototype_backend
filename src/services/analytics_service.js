@@ -1,50 +1,56 @@
-const db = require("../db");
+const prisma = require("../db/prisma");
 
 exports.getFacilityPeakUsage = async () => {
-  // 1️⃣ Hour-wise usage per facility
-  const [rows] = await db.execute(
-    `SELECT
-        facility_id,
-        HOUR(entry_time) AS hour,
-        COUNT(*) AS entries
-     FROM facility_sessions
-     GROUP BY facility_id, hour
-     ORDER BY facility_id, hour`
-  );
+  // Get all sessions with entry time
+  const sessions = await prisma.facilitySession.findMany({
+    select: {
+      facility_id: true,
+      entry_time: true
+    }
+  });
 
-  if (rows.length === 0) {
+  if (sessions.length === 0) {
     return [];
   }
 
-  // 2️⃣ Organize data by facility
+  // Organize data by facility and hour
   const facilityMap = {};
 
-  for (const row of rows) {
-    if (!facilityMap[row.facility_id]) {
-      facilityMap[row.facility_id] = [];
+  for (const session of sessions) {
+    const hour = new Date(session.entry_time).getHours();
+    const facility = session.facility_id;
+
+    if (!facilityMap[facility]) {
+      facilityMap[facility] = {};
     }
 
-    facilityMap[row.facility_id].push({
-      hour: row.hour,
-      entries: row.entries
-    });
+    if (!facilityMap[facility][hour]) {
+      facilityMap[facility][hour] = 0;
+    }
+
+    facilityMap[facility][hour]++;
   }
 
-  // 3️⃣ Compute peak hour per facility
+  // Compute peak hour per facility
   const result = [];
 
   for (const facility in facilityMap) {
-    const hourlyData = facilityMap[facility];
-
+    const hourlyData = [];
     let peakHour = null;
     let peakEntries = 0;
 
-    for (const h of hourlyData) {
-      if (h.entries > peakEntries) {
-        peakEntries = h.entries;
-        peakHour = h.hour;
+    for (const hour in facilityMap[facility]) {
+      const entries = facilityMap[facility][hour];
+      hourlyData.push({ hour: parseInt(hour), entries });
+
+      if (entries > peakEntries) {
+        peakEntries = entries;
+        peakHour = parseInt(hour);
       }
     }
+
+    // Sort hourly data by hour
+    hourlyData.sort((a, b) => a.hour - b.hour);
 
     result.push({
       facility,
@@ -57,82 +63,104 @@ exports.getFacilityPeakUsage = async () => {
   return result;
 };
 
-
 exports.getMissingEquipment = async () => {
-  // 1️⃣ Summary: total missing per equipment
-  const [summaryRows] = await db.execute(
-    `SELECT
-        equipment_type,
-        SUM(issued_qty - returned_qty) AS total_missing
-     FROM equipment_issue_items
-     WHERE issued_qty > returned_qty
-     GROUP BY equipment_type
-     HAVING total_missing > 0
-     ORDER BY total_missing DESC`
-  );
+  // Get all issue items - we'll filter in JS since Prisma doesn't support field comparison
+  const items = await prisma.equipmentIssueItem.findMany({
+    include: {
+      issue: true
+    }
+  });
 
-  // 2️⃣ Details: who has what missing
-  const [detailRows] = await db.execute(
-    `SELECT
-        ei.equipment_type,
-        i.student_id,
-        i.student_name,
-        i.issue_id,
-        i.issued_at,
-        (ei.issued_qty - ei.returned_qty) AS missing_qty
-     FROM equipment_issue_items ei
-     JOIN equipment_issues i
-       ON ei.issue_id = i.issue_id
-     WHERE ei.issued_qty > ei.returned_qty
-       AND i.status IN ('ISSUED', 'PARTIAL_RETURN')
-     ORDER BY i.issued_at ASC`
-  );
+  // Filter items where issued > returned
+  const missingItems = items.filter((item) => item.issued_qty > item.returned_qty);
+
+  // Summary: total missing per equipment type
+  const summaryMap = {};
+  for (const item of missingItems) {
+    const type = item.equipment_type;
+    const missing = item.issued_qty - item.returned_qty;
+
+    if (!summaryMap[type]) {
+      summaryMap[type] = 0;
+    }
+    summaryMap[type] += missing;
+  }
+
+  const summary = Object.entries(summaryMap)
+    .map(([equipment_type, total_missing]) => ({
+      equipment_type,
+      total_missing
+    }))
+    .sort((a, b) => b.total_missing - a.total_missing);
+
+  // Details
+  const details = missingItems
+    .filter((item) => 
+      item.issue.status === "ISSUED" || item.issue.status === "PARTIAL_RETURN"
+    )
+    .map((item) => ({
+      equipment_type: item.equipment_type,
+      student_id: item.issue.student_id,
+      student_name: item.issue.student_name,
+      issue_id: item.issue.issue_id,
+      issued_at: item.issue.issued_at,
+      missing_qty: item.issued_qty - item.returned_qty
+    }))
+    .sort((a, b) => new Date(a.issued_at) - new Date(b.issued_at));
 
   return {
-    summary: summaryRows,
-    details: detailRows
+    summary,
+    details
   };
 };
 
-
-
 exports.getFacilityTrends = async (facility, granularity) => {
-  let groupExpr;
-  let labelExpr;
+  const sessions = await prisma.facilitySession.findMany({
+    where: { facility_id: facility },
+    select: { entry_time: true },
+    orderBy: { entry_time: "asc" }
+  });
 
-  switch (granularity) {
-    case "daily":
-      groupExpr = "DATE(entry_time)";
-      labelExpr = "DATE(entry_time)";
-      break;
+  const periodMap = {};
 
-    case "weekly":
-      groupExpr = "YEARWEEK(entry_time)";
-      labelExpr = "YEARWEEK(entry_time)";
-      break;
+  for (const session of sessions) {
+    const date = new Date(session.entry_time);
+    let period;
 
-    case "monthly":
-      groupExpr = "DATE_FORMAT(entry_time, '%Y-%m')";
-      labelExpr = "DATE_FORMAT(entry_time, '%Y-%m')";
-      break;
+    switch (granularity) {
+      case "daily":
+        period = date.toISOString().split("T")[0]; // YYYY-MM-DD
+        break;
+
+      case "weekly":
+        // Get ISO week
+        const startOfYear = new Date(date.getFullYear(), 0, 1);
+        const days = Math.floor((date - startOfYear) / (24 * 60 * 60 * 1000));
+        const week = Math.ceil((days + startOfYear.getDay() + 1) / 7);
+        period = `${date.getFullYear()}-W${week.toString().padStart(2, "0")}`;
+        break;
+
+      case "monthly":
+        period = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, "0")}`;
+        break;
+
+      default:
+        period = date.toISOString().split("T")[0];
+    }
+
+    if (!periodMap[period]) {
+      periodMap[period] = 0;
+    }
+    periodMap[period]++;
   }
 
-  const [rows] = await db.execute(
-    `
-    SELECT
-      ${labelExpr} AS period,
-      COUNT(*) AS entries
-    FROM facility_sessions
-    WHERE facility_id = ?
-    GROUP BY ${groupExpr}
-    ORDER BY ${groupExpr}
-    `,
-    [facility]
-  );
+  const data = Object.entries(periodMap)
+    .map(([period, entries]) => ({ period, entries }))
+    .sort((a, b) => a.period.localeCompare(b.period));
 
   return {
     facility,
     granularity,
-    data: rows
+    data
   };
 };

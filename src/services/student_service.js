@@ -1,17 +1,21 @@
-const db = require("../db");
+const prisma = require("../db/prisma");
 
 exports.searchStudents = async (query) => {
-  const likeQuery = `%${query}%`;
+  const students = await prisma.student.findMany({
+    where: {
+      OR: [
+        { student_name: { contains: query } },
+        { student_id: { contains: query } }
+      ]
+    },
+    orderBy: {
+      student_name: "asc"
+    },
+    take: 10
+  });
 
-  const [students] = await db.execute(
-    `SELECT student_id, student_name
-     FROM students
-     WHERE student_name LIKE ?
-        OR student_id LIKE ?
-     ORDER BY student_name
-     LIMIT 10`,
-    [likeQuery, likeQuery]
-  );
-
-  return students;
+  return students.map((s) => ({
+    student_id: s.student_id,
+    student_name: s.student_name
+  }));
 };

@@ -36,3 +36,38 @@ exports.authenticateAdmin = (req, res, next) => {
     });
   }
 };
+
+/**
+ * Role-based authorization middleware
+ * @param {string[]} allowedRoles - Array of roles that can access the route
+ */
+exports.authorizeRoles = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.admin) {
+      return res.status(401).json({
+        error: "Authentication required"
+      });
+    }
+
+    const userRole = req.admin.role || "MANAGEMENT"; // Default for legacy tokens
+
+    if (!allowedRoles.includes(userRole)) {
+      return res.status(403).json({
+        error: "Access denied",
+        message: `This action requires one of these roles: ${allowedRoles.join(", ")}`
+      });
+    }
+
+    next();
+  };
+};
+
+/**
+ * Role constants for convenience
+ */
+exports.ROLES = {
+  MANAGEMENT: "MANAGEMENT",
+  OPERATOR: "OPERATOR",
+  GUARD: "GUARD",
+  AUDITOR: "AUDITOR"
+};

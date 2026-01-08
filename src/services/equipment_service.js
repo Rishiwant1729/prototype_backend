@@ -1,268 +1,206 @@
-const db = require("../db");
+const prisma = require("../db/prisma");
 const { v4: uuidv4 } = require("uuid");
 
-// Issue equipment to a student
-exports.issueEquipment = async (uid, assistant_id, items) => {
-  // 1️⃣ Resolve UID → student
-  const [students] = await db.execute(
-    `SELECT s.student_id, s.student_name
-     FROM rfid_mapping r
-     JOIN students s ON r.student_id = s.student_id
-     WHERE r.uid = ? AND r.status = 'active'`,
-    [uid]
-  );
-
-  if (students.length === 0) {
-    return {
-      action: "REJECTED",
-      reason: "Unknown or inactive card"
-    };
-  }
-
-  const student = students[0];
-
-  // 2️⃣ Validate items
-  for (const item of items) {
-    if (
-      !item.equipment_type ||
-      typeof item.qty !== "number" ||
-      item.qty <= 0
-    ) {
-      return {
-        action: "REJECTED",
-        reason: "Invalid equipment item or quantity"
-      };
+exports.getAvailableEquipment = async (facility) => {
+  const equipment = await prisma.facilityEquipment.findMany({
+    where: {
+      facility_id: facility,
+      available_quantity: { gt: 0 }
+    },
+    include: {
+      equipment: true
     }
-  }
+  });
 
-  // 3️⃣ Create equipment issue (parent)
-  const issue_id = uuidv4();
+  return equipment.map((e) => ({
+    equipment_id: e.equipment_id,
+    equipment_name: e.equipment.name,
+    equipment_type: e.equipment.category,
+    available_quantity: e.available_quantity
+  }));
+};
 
-  await db.execute(
-    `INSERT INTO equipment_issues
-     (issue_id, uid, student_id, student_name, status, issued_at, assistant_id)
-     VALUES (?, ?, ?, ?, 'ISSUED', NOW(), ?)`,
-    [
-      issue_id,
-      uid,
-      student.student_id,
-      student.student_name,
-      assistant_id
-    ]
-  );
+exports.issueEquipment = async (uid, facility, assistant_id, items) => {
+  try {
+    // Use Prisma transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // 1️⃣ Resolve UID → student
+      const rfidMapping = await tx.rfidMapping.findFirst({
+        where: {
+          uid,
+          status: "active"
+        },
+        include: {
+          student: true
+        }
+      });
 
-  // 4️⃣ Create equipment issue items (children)
-  for (const item of items) {
-    const item_id = uuidv4();
+      if (!rfidMapping) {
+        throw new Error("Unknown or inactive card");
+      }
 
-    await db.execute(
-      `INSERT INTO equipment_issue_items
-       (item_id, issue_id, equipment_type, issued_qty, returned_qty, status)
-       VALUES (?, ?, ?, ?, 0, 'ISSUED')`,
-      [
-        item_id,
+      const student = rfidMapping.student;
+
+      // 2️⃣ Validate inventory
+      for (const item of items) {
+        const facilityEquip = await tx.facilityEquipment.findUnique({
+          where: {
+            facility_id_equipment_id: {
+              facility_id: facility,
+              equipment_id: item.equipment_id
+            }
+          }
+        });
+
+        if (!facilityEquip) {
+          throw new Error("Equipment not available in this facility");
+        }
+
+        if (facilityEquip.available_quantity < item.qty) {
+          throw new Error(
+            `Not enough stock for equipment_id ${item.equipment_id}`
+          );
+        }
+      }
+
+      // 3️⃣ Create issue
+      const issue_id = uuidv4();
+
+      await tx.equipmentIssue.create({
+        data: {
+          issue_id,
+          uid,
+          student_id: student.student_id,
+          student_name: student.student_name,
+          status: "ISSUED",
+          issued_at: new Date(),
+          assistant_id: String(assistant_id)
+        }
+      });
+
+      // 4️⃣ Insert items + decrement stock
+      for (const item of items) {
+        await tx.equipmentIssueItem.create({
+          data: {
+            item_id: uuidv4(),
+            issue_id,
+            equipment_type: item.equipment_type,
+            issued_qty: item.qty,
+            returned_qty: 0,
+            status: "ISSUED"
+          }
+        });
+
+        await tx.facilityEquipment.update({
+          where: {
+            facility_id_equipment_id: {
+              facility_id: facility,
+              equipment_id: item.equipment_id
+            }
+          },
+          data: {
+            available_quantity: {
+              decrement: item.qty
+            }
+          }
+        });
+      }
+
+      return {
+        action: "ISSUED",
         issue_id,
-        item.equipment_type,
-        item.qty
-      ]
-    );
-  }
-
-  // 5️⃣ Return success response
-  return {
-    action: "ISSUED",
-    issue_id,
-    student: student.student_name,
-    student_id: student.student_id,
-    items
-  };
-};
-
-exports.returnEquipment = async (issue_id, returns) => {
-  // 1️⃣ Fetch issue
-  const [issues] = await db.execute(
-    `SELECT issue_id, status
-     FROM equipment_issues
-     WHERE issue_id = ?`,
-    [issue_id]
-  );
-
-  if (issues.length === 0) {
-    return {
-      action: "REJECTED",
-      reason: "Invalid issue_id"
-    };
-  }
-
-  if (issues[0].status === "RETURNED") {
-    return {
-      action: "REJECTED",
-      reason: "Issue already closed"
-    };
-  }
-
-  // 2️⃣ Process each returned item
-  for (const ret of returns) {
-    if (
-      !ret.equipment_type ||
-      typeof ret.qty !== "number" ||
-      ret.qty <= 0
-    ) {
-      return {
-        action: "REJECTED",
-        reason: "Invalid return item or quantity"
+        student: student.student_name,
+        student_id: student.student_id
       };
-    }
+    });
 
-    // Fetch issued item
-    const [items] = await db.execute(
-      `SELECT item_id, issued_qty, returned_qty
-       FROM equipment_issue_items
-       WHERE issue_id = ?
-         AND equipment_type = ?`,
-      [issue_id, ret.equipment_type]
-    );
-
-    if (items.length === 0) {
-      return {
-        action: "REJECTED",
-        reason: `Item not found: ${ret.equipment_type}`
-      };
-    }
-
-    const item = items[0];
-    const newReturnedQty = item.returned_qty + ret.qty;
-
-    // ❌ Cannot return more than issued
-    if (newReturnedQty > item.issued_qty) {
-      return {
-        action: "REJECTED",
-        reason: `Return exceeds issued quantity for ${ret.equipment_type}`
-      };
-    }
-
-    // Determine item status
-    const newStatus =
-      newReturnedQty === item.issued_qty
-        ? "RETURNED"
-        : "PARTIAL_RETURN";
-
-    // Update item
-    await db.execute(
-      `UPDATE equipment_issue_items
-       SET returned_qty = ?,
-           status = ?
-       WHERE item_id = ?`,
-      [newReturnedQty, newStatus, item.item_id]
-    );
-  }
-
-  // 3️⃣ Recalculate issue status
-  const [pendingItems] = await db.execute(
-    `SELECT COUNT(*) AS pending
-     FROM equipment_issue_items
-     WHERE issue_id = ?
-       AND status != 'RETURNED'`,
-    [issue_id]
-  );
-
-  if (pendingItems[0].pending === 0) {
-    // All items returned
-    await db.execute(
-      `UPDATE equipment_issues
-       SET status = 'RETURNED',
-           returned_at = NOW()
-       WHERE issue_id = ?`,
-      [issue_id]
-    );
-
-    return {
-      action: "RETURNED",
-      issue_id
-    };
-  } else {
-    // Partial return
-    await db.execute(
-      `UPDATE equipment_issues
-       SET status = 'PARTIAL_RETURN'
-       WHERE issue_id = ?`,
-      [issue_id]
-    );
-
-    return {
-      action: "PARTIAL_RETURN",
-      issue_id
-    };
+    return result;
+  } catch (err) {
+    return { action: "REJECTED", reason: err.message };
   }
 };
 
+exports.returnEquipment = async (issue_id, assistant_id, items) => {
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      // Get the issue
+      const issue = await tx.equipmentIssue.findUnique({
+        where: { issue_id },
+        include: { items: true }
+      });
+
+      if (!issue) {
+        throw new Error("Issue not found");
+      }
+
+      let allReturned = true;
+
+      for (const item of items) {
+        const issueItem = await tx.equipmentIssueItem.findFirst({
+          where: {
+            issue_id,
+            equipment_type: item.equipment_type
+          }
+        });
+
+        if (!issueItem) {
+          throw new Error(`Item ${item.equipment_type} not found in issue`);
+        }
+
+        const newReturnedQty = (issueItem.returned_qty || 0) + item.qty;
+
+        if (newReturnedQty > issueItem.issued_qty) {
+          throw new Error(`Cannot return more than issued for ${item.equipment_type}`);
+        }
+
+        const itemStatus = newReturnedQty === issueItem.issued_qty ? "RETURNED" : "PARTIAL_RETURN";
+
+        await tx.equipmentIssueItem.update({
+          where: { item_id: issueItem.item_id },
+          data: {
+            returned_qty: newReturnedQty,
+            status: itemStatus
+          }
+        });
+
+        if (newReturnedQty < issueItem.issued_qty) {
+          allReturned = false;
+        }
+      }
+
+      // Update issue status
+      const issueStatus = allReturned ? "RETURNED" : "PARTIAL_RETURN";
+      
+      await tx.equipmentIssue.update({
+        where: { issue_id },
+        data: {
+          status: issueStatus,
+          returned_at: allReturned ? new Date() : null
+        }
+      });
+
+      return {
+        action: issueStatus,
+        issue_id
+      };
+    });
+
+    return result;
+  } catch (err) {
+    return { action: "REJECTED", reason: err.message };
+  }
+};
 
 exports.getStudentHistory = async (student_id) => {
-  // 1️⃣ Validate student
-  const [students] = await db.execute(
-    `SELECT student_id, student_name
-     FROM students
-     WHERE student_id = ?`,
-    [student_id]
-  );
-
-  if (students.length === 0) {
-    return {
-      action: "REJECTED",
-      reason: "Student not found"
-    };
-  }
-
-  const student = students[0];
-
-  // 2️⃣ Fetch all equipment issues for student
-  const [issues] = await db.execute(
-    `SELECT issue_id, status, issued_at, returned_at, assistant_id
-     FROM equipment_issues
-     WHERE student_id = ?
-     ORDER BY issued_at DESC`,
-    [student_id]
-  );
-
-  const pending = [];
-  const returned = [];
-
-  // 3️⃣ For each issue, fetch items and classify
-  for (const issue of issues) {
-    const [items] = await db.execute(
-      `SELECT equipment_type, issued_qty, returned_qty
-       FROM equipment_issue_items
-       WHERE issue_id = ?`,
-      [issue.issue_id]
-    );
-
-    const formattedItems = items.map(item => ({
-      equipment_type: item.equipment_type,
-      issued_qty: item.issued_qty,
-      returned_qty: item.returned_qty,
-      missing: item.issued_qty - item.returned_qty
-    }));
-
-    const issueData = {
-      issue_id: issue.issue_id,
-      issued_at: issue.issued_at,
-      returned_at: issue.returned_at,
-      assistant_id: issue.assistant_id,
-      items: formattedItems
-    };
-
-    if (issue.status === "RETURNED") {
-      returned.push(issueData);
-    } else {
-      pending.push(issueData);
+  const issues = await prisma.equipmentIssue.findMany({
+    where: { student_id },
+    include: {
+      items: true
+    },
+    orderBy: {
+      issued_at: "desc"
     }
-  }
+  });
 
-  // 4️⃣ Final response
-  return {
-    student_id: student.student_id,
-    student_name: student.student_name,
-    pending,
-    returned
-  };
+  return issues;
 };

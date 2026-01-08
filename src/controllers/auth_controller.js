@@ -31,3 +31,20 @@ exports.login = async (req, res) => {
     return res.status(500).json({ error: "Internal server error" });
   }
 };
+
+
+
+exports.status = async (req, res) => {
+  try {
+    const [rows] = await require("../db").execute(
+      "SELECT COUNT(*) AS count FROM admins"
+    );
+
+    res.json({
+      admin_exists: rows[0].count > 0
+    });
+  } catch (err) {
+    console.error("Auth status error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
