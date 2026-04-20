@@ -131,6 +131,26 @@ exports.getHeatmapData = async (req, res) => {
   }
 };
 
+exports.getFootfallAnalyticsSummary = async (req, res) => {
+  try {
+    const { facility, startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: "startDate and endDate are required" });
+    }
+
+    const result = await dashboardService.getFootfallAnalyticsSummary(
+      facility,
+      startDate,
+      endDate
+    );
+    return res.json(result);
+  } catch (err) {
+    console.error("Footfall analytics summary error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+};
+
 // ============================================
 // EVENTS & TABLES
 // ============================================
@@ -181,9 +201,15 @@ exports.getOverdueReturns = async (req, res) => {
 
 exports.getAlerts = async (req, res) => {
   try {
-    const unmatchedEntries = await dashboardService.getUnmatchedEntries(4);
-    const overdueReturns = await dashboardService.getOverdueReturns(24);
-    
+    const entryExitScope = req.query.scope === "entry_exit";
+    const unmatchedEntries = await dashboardService.getUnmatchedEntries(
+      4,
+      entryExitScope ? dashboardService.ENTRY_EXIT_FACILITY_IDS : null
+    );
+    const overdueReturns = entryExitScope
+      ? []
+      : await dashboardService.getOverdueReturns(24);
+
     return res.json({
       unmatched_entries: unmatchedEntries,
       overdue_returns: overdueReturns,
@@ -242,9 +268,8 @@ exports.getDailySummary = async (req, res) => {
 
 exports.getDashboardOverview = async (req, res) => {
   try {
-    const today = new Date();
-    const todayStr = today.toISOString().split("T")[0];
-    
+    const entryExitScope = req.query.scope === "entry_exit";
+
     // Get all KPI data in parallel
     const [
       occupancy,
@@ -252,21 +277,34 @@ exports.getDashboardOverview = async (req, res) => {
       activeEquipment,
       alerts
     ] = await Promise.all([
-      dashboardService.getCurrentOccupancy(),
-      dashboardService.getTodayVisitors(),
-      dashboardService.getActiveEquipmentIssues(),
-      Promise.all([
-        dashboardService.getUnmatchedEntries(4),
-        dashboardService.getOverdueReturns(24)
-      ]).then(([unmatched, overdue]) => ({
-        unmatched_entries: unmatched.length,
-        overdue_returns: overdue.length,
-        total: unmatched.length + overdue.length
-      }))
+      dashboardService.getCurrentOccupancy(entryExitScope),
+      dashboardService.getTodayVisitors(entryExitScope),
+      entryExitScope
+        ? Promise.resolve({
+            active_issues: 0,
+            total_pending_items: 0,
+            issues: []
+          })
+        : dashboardService.getActiveEquipmentIssues(),
+      entryExitScope
+        ? dashboardService.getUnmatchedEntries(4, dashboardService.ENTRY_EXIT_FACILITY_IDS).then((unmatched) => ({
+            unmatched_entries: unmatched.length,
+            overdue_returns: 0,
+            total: unmatched.length
+          }))
+        : Promise.all([
+            dashboardService.getUnmatchedEntries(4),
+            dashboardService.getOverdueReturns(24)
+          ]).then(([unmatched, overdue]) => ({
+            unmatched_entries: unmatched.length,
+            overdue_returns: overdue.length,
+            total: unmatched.length + overdue.length
+          }))
     ]);
-    
+
     return res.json({
       timestamp: new Date().toISOString(),
+      scope: entryExitScope ? "entry_exit" : "full",
       occupancy,
       visitors,
       active_equipment: activeEquipment,

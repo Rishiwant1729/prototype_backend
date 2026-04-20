@@ -1,5 +1,23 @@
 const prisma = require("../db/prisma");
 
+/** Gate facilities only (excludes sport room desk / equipment flows). */
+const ENTRY_EXIT_FACILITY_IDS = ["GYM", "BADMINTON", "SWIMMING"];
+exports.ENTRY_EXIT_FACILITY_IDS = ENTRY_EXIT_FACILITY_IDS;
+
+const FACILITY_LABELS = {
+  GYM: "Gymnasium",
+  BADMINTON: "Badminton court",
+  SWIMMING: "Swimming pool",
+  SPORTS_ROOM: "Sport room"
+};
+
+function facilityFilterClause(facility) {
+  if (facility && facility !== "ALL") {
+    return { facility_id: facility };
+  }
+  return { facility_id: { in: ENTRY_EXIT_FACILITY_IDS } };
+}
+
 /**
  * Dashboard Analytics Service
  * Provides comprehensive analytics for the management dashboard
@@ -12,7 +30,7 @@ const prisma = require("../db/prisma");
 /**
  * Get current occupancy per facility
  */
-exports.getCurrentOccupancy = async () => {
+exports.getCurrentOccupancy = async (entryExitOnly = false) => {
   const activeSessionsRaw = await prisma.facilitySession.groupBy({
     by: ["facility_id"],
     where: {
@@ -31,7 +49,7 @@ exports.getCurrentOccupancy = async () => {
     }
   });
 
-  const occupancy = facilities.map((f) => {
+  let occupancy = facilities.map((f) => {
     const active = activeSessionsRaw.find((a) => a.facility_id === f.facility_id);
     return {
       facility_id: f.facility_id,
@@ -39,6 +57,10 @@ exports.getCurrentOccupancy = async () => {
       current_count: active?._count?.session_id || 0
     };
   });
+
+  if (entryExitOnly) {
+    occupancy = occupancy.filter((f) => ENTRY_EXIT_FACILITY_IDS.includes(f.facility_id));
+  }
 
   const totalOccupancy = occupancy.reduce((sum, f) => sum + f.current_count, 0);
 
@@ -51,7 +73,7 @@ exports.getCurrentOccupancy = async () => {
 /**
  * Get today's unique visitors per facility
  */
-exports.getTodayVisitors = async () => {
+exports.getTodayVisitors = async (entryExitOnly = false) => {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
@@ -63,7 +85,8 @@ exports.getTodayVisitors = async () => {
       entry_time: {
         gte: today,
         lt: tomorrow
-      }
+      },
+      ...(entryExitOnly ? { facility_id: { in: ENTRY_EXIT_FACILITY_IDS } } : {})
     },
     select: {
       facility_id: true,
@@ -231,8 +254,43 @@ exports.getScanCounts = async (startDate, endDate) => {
 // TIME SERIES DATA
 // ============================================
 
+function entryPeriodFromDate(date, granularity) {
+  const d = new Date(date);
+  switch (granularity) {
+    case "hourly":
+      return `${d.toISOString().split("T")[0]} ${d.getHours().toString().padStart(2, "0")}:00`;
+    case "daily":
+      return d.toISOString().split("T")[0];
+    case "weekly": {
+      const startOfYear = new Date(d.getFullYear(), 0, 1);
+      const days = Math.floor((d - startOfYear) / (24 * 60 * 60 * 1000));
+      const week = Math.ceil((days + startOfYear.getDay() + 1) / 7);
+      return `${d.getFullYear()}-W${week.toString().padStart(2, "0")}`;
+    }
+    case "monthly":
+      return `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, "0")}`;
+    default:
+      return d.toISOString().split("T")[0];
+  }
+}
+
+function exitPeriodFromSession(entryPeriod, exitTime, granularity) {
+  if (!exitTime) return null;
+  const exitDate = new Date(exitTime);
+  switch (granularity) {
+    case "hourly":
+      return `${exitDate.toISOString().split("T")[0]} ${exitDate.getHours().toString().padStart(2, "0")}:00`;
+    case "daily":
+      return exitDate.toISOString().split("T")[0];
+    default:
+      return entryPeriod;
+  }
+}
+
 /**
- * Get occupancy over time for charts
+ * Get occupancy over time for charts.
+ * When facility is ALL (entry/exit gates only, never sport room): includes `by_facility` with one series per gate
+ * so the UI can draw separate lines. Single facility returns one `by_facility` row plus aggregated `data`.
  */
 exports.getOccupancyTimeSeries = async (facility, startDate, endDate, granularity = "hourly") => {
   const start = new Date(startDate);
@@ -247,7 +305,12 @@ exports.getOccupancyTimeSeries = async (facility, startDate, endDate, granularit
 
   if (facility && facility !== "ALL") {
     whereClause.facility_id = facility;
+  } else {
+    whereClause.facility_id = { in: ENTRY_EXIT_FACILITY_IDS };
   }
+
+  const facilitiesToTrack =
+    facility && facility !== "ALL" ? [facility] : [...ENTRY_EXIT_FACILITY_IDS];
 
   const sessions = await prisma.facilitySession.findMany({
     where: whereClause,
@@ -261,71 +324,72 @@ exports.getOccupancyTimeSeries = async (facility, startDate, endDate, granularit
     }
   });
 
-  // Group by time period
   const periodMap = {};
+  const perFacility = {};
+  facilitiesToTrack.forEach((id) => {
+    perFacility[id] = {};
+  });
+
+  const bump = (map, period, field) => {
+    if (!map[period]) map[period] = { entries: 0, exits: 0 };
+    map[period][field] += 1;
+  };
 
   sessions.forEach((session) => {
-    const date = new Date(session.entry_time);
-    let period;
+    const fid = session.facility_id;
+    const period = entryPeriodFromDate(session.entry_time, granularity);
 
-    switch (granularity) {
-      case "hourly":
-        period = `${date.toISOString().split("T")[0]} ${date.getHours().toString().padStart(2, "0")}:00`;
-        break;
-      case "daily":
-        period = date.toISOString().split("T")[0];
-        break;
-      case "weekly":
-        const startOfYear = new Date(date.getFullYear(), 0, 1);
-        const days = Math.floor((date - startOfYear) / (24 * 60 * 60 * 1000));
-        const week = Math.ceil((days + startOfYear.getDay() + 1) / 7);
-        period = `${date.getFullYear()}-W${week.toString().padStart(2, "0")}`;
-        break;
-      case "monthly":
-        period = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, "0")}`;
-        break;
-      default:
-        period = date.toISOString().split("T")[0];
+    bump(periodMap, period, "entries");
+    if (perFacility[fid]) {
+      bump(perFacility[fid], period, "entries");
     }
-
-    if (!periodMap[period]) {
-      periodMap[period] = { entries: 0, exits: 0 };
-    }
-    periodMap[period].entries++;
 
     if (session.exit_time) {
-      const exitDate = new Date(session.exit_time);
-      let exitPeriod;
-      switch (granularity) {
-        case "hourly":
-          exitPeriod = `${exitDate.toISOString().split("T")[0]} ${exitDate.getHours().toString().padStart(2, "0")}:00`;
-          break;
-        case "daily":
-          exitPeriod = exitDate.toISOString().split("T")[0];
-          break;
-        default:
-          exitPeriod = period;
+      const exitPeriod = exitPeriodFromSession(period, session.exit_time, granularity);
+      if (exitPeriod) {
+        bump(periodMap, exitPeriod, "exits");
+        if (perFacility[fid]) {
+          bump(perFacility[fid], exitPeriod, "exits");
+        }
       }
-      if (!periodMap[exitPeriod]) {
-        periodMap[exitPeriod] = { entries: 0, exits: 0 };
-      }
-      periodMap[exitPeriod].exits++;
     }
   });
 
-  const data = Object.entries(periodMap)
-    .map(([period, counts]) => ({
-      period,
-      entries: counts.entries,
-      exits: counts.exits,
-      net: counts.entries - counts.exits
-    }))
-    .sort((a, b) => a.period.localeCompare(b.period));
+  const periodSet = new Set(Object.keys(periodMap));
+  facilitiesToTrack.forEach((fid) => {
+    Object.keys(perFacility[fid]).forEach((p) => periodSet.add(p));
+  });
+  const sortedPeriods = [...periodSet].sort((a, b) => a.localeCompare(b));
+
+  const data = sortedPeriods.map((p) => {
+    const c = periodMap[p] || { entries: 0, exits: 0 };
+    return {
+      period: p,
+      entries: c.entries,
+      exits: c.exits,
+      net: c.entries - c.exits
+    };
+  });
+
+  const by_facility = facilitiesToTrack.map((fid) => ({
+    facility_id: fid,
+    label: FACILITY_LABELS[fid] || fid,
+    data: sortedPeriods.map((p) => {
+      const c = perFacility[fid][p] || { entries: 0, exits: 0 };
+      return {
+        period: p,
+        entries: c.entries,
+        exits: c.exits,
+        net: c.entries - c.exits
+      };
+    })
+  }));
 
   return {
     facility: facility || "ALL",
     granularity,
-    data
+    data,
+    by_facility
   };
 };
 
@@ -345,6 +409,8 @@ exports.getHourlyDistribution = async (facility, startDate, endDate) => {
 
   if (facility && facility !== "ALL") {
     whereClause.facility_id = facility;
+  } else {
+    whereClause.facility_id = { in: ENTRY_EXIT_FACILITY_IDS };
   }
 
   const sessions = await prisma.facilitySession.findMany({
@@ -385,6 +451,8 @@ exports.getHeatmapData = async (facility, startDate, endDate) => {
 
   if (facility && facility !== "ALL") {
     whereClause.facility_id = facility;
+  } else {
+    whereClause.facility_id = { in: ENTRY_EXIT_FACILITY_IDS };
   }
 
   const sessions = await prisma.facilitySession.findMany({
@@ -425,6 +493,135 @@ exports.getHeatmapData = async (facility, startDate, endDate) => {
   };
 };
 
+/**
+ * Footfall analytics summary for admin dashboard (entries/exits, peaks, share, duration trend).
+ * Scoped the same way as time-series: ALL = entry/exit gates only.
+ */
+exports.getFootfallAnalyticsSummary = async (facility, startDate, endDate) => {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  const fac = facilityFilterClause(facility);
+
+  const entryWhere = {
+    entry_time: { gte: start, lte: end },
+    ...fac
+  };
+  const exitWhere = {
+    exit_time: { gte: start, lte: end, not: null },
+    ...fac
+  };
+
+  const spanMs = Math.max(end.getTime() - start.getTime(), 24 * 60 * 60 * 1000);
+  const prevEnd = new Date(start.getTime() - 1);
+  const prevStart = new Date(prevEnd.getTime() - spanMs);
+  const prevEntryWhere = {
+    entry_time: { gte: prevStart, lte: prevEnd },
+    ...fac
+  };
+
+  const [
+    total_entries,
+    total_exits,
+    uniqueVisitorsRows,
+    entryTimesOnly,
+    byFacility,
+    durationRows,
+    prev_total_entries
+  ] = await Promise.all([
+    prisma.facilitySession.count({ where: entryWhere }),
+    prisma.facilitySession.count({ where: exitWhere }),
+    prisma.facilitySession.findMany({
+      where: entryWhere,
+      select: { student_id: true },
+      distinct: ["student_id"]
+    }),
+    prisma.facilitySession.findMany({
+      where: entryWhere,
+      select: { entry_time: true }
+    }),
+    prisma.facilitySession.groupBy({
+      by: ["facility_id"],
+      where: entryWhere,
+      _count: { session_id: true }
+    }),
+    prisma.facilitySession.findMany({
+      where: {
+        ...fac,
+        exit_time: { not: null, gte: start, lte: end },
+        duration_minutes: { not: null }
+      },
+      select: { entry_time: true, duration_minutes: true }
+    }),
+    prisma.facilitySession.count({ where: prevEntryWhere })
+  ]);
+
+  const unique_visitors = uniqueVisitorsRows.length;
+
+  const hourCounts = Array(24).fill(0);
+  entryTimesOnly.forEach((s) => {
+    hourCounts[new Date(s.entry_time).getHours()]++;
+  });
+  const maxHour = Math.max(...hourCounts, 0);
+  const peakIdx = maxHour === 0 ? 0 : hourCounts.indexOf(maxHour);
+  const nextHour = (peakIdx + 1) % 24;
+  const peak_hour_label = `${String(peakIdx).padStart(2, "0")}:00–${String(nextHour).padStart(2, "0")}:00`;
+  const peak_hour_count = hourCounts[peakIdx] || 0;
+
+  const avg_session_minutes =
+    durationRows.length === 0
+      ? 0
+      : Math.round(
+          durationRows.reduce((sum, s) => sum + (Number(s.duration_minutes) || 0), 0) /
+            durationRows.length
+        );
+
+  const totalEntryShare = byFacility.reduce((s, b) => s + b._count.session_id, 0);
+  const facility_share = byFacility
+    .map((b) => ({
+      facility_id: b.facility_id,
+      label: FACILITY_LABELS[b.facility_id] || b.facility_id,
+      entries: b._count.session_id,
+      pct: totalEntryShare ? Math.round((b._count.session_id / totalEntryShare) * 1000) / 10 : 0
+    }))
+    .sort((a, b) => b.entries - a.entries);
+
+  const dayDur = {};
+  durationRows.forEach((s) => {
+    const d = new Date(s.entry_time).toISOString().split("T")[0];
+    if (!dayDur[d]) dayDur[d] = { sum: 0, n: 0 };
+    dayDur[d].sum += Number(s.duration_minutes) || 0;
+    dayDur[d].n += 1;
+  });
+  const daily_avg_duration = Object.entries(dayDur)
+    .map(([day, v]) => ({
+      day,
+      avg_minutes: Math.round(v.sum / v.n)
+    }))
+    .sort((a, b) => a.day.localeCompare(b.day));
+
+  const entries_growth_pct =
+    prev_total_entries === 0
+      ? null
+      : Math.round(((total_entries - prev_total_entries) / prev_total_entries) * 1000) / 10;
+
+  return {
+    facility: facility || "ALL",
+    startDate,
+    endDate,
+    kpis: {
+      total_entries,
+      total_exits,
+      unique_visitors,
+      peak_hour_label,
+      peak_hour_count,
+      avg_session_minutes,
+      entries_growth_pct
+    },
+    facility_share,
+    daily_avg_duration
+  };
+};
+
 // ============================================
 // RECENT EVENTS & TABLES
 // ============================================
@@ -435,12 +632,17 @@ exports.getHeatmapData = async (facility, startDate, endDate) => {
 exports.getRecentEvents = async (limit = 50, facility = null) => {
   // Get recent facility sessions
   const sessionWhereClause = {};
-  if (facility && facility !== "ALL" && facility !== "SPORTS_ROOM") {
+  if (facility === "SPORTS_ROOM") {
+    sessionWhereClause.facility_id = "__NONE__";
+  } else if (facility && facility !== "ALL") {
     sessionWhereClause.facility_id = facility;
+  } else {
+    // ALL, null, undefined: aggregate entry/exit gates only (no sport room sessions)
+    sessionWhereClause.facility_id = { in: ENTRY_EXIT_FACILITY_IDS };
   }
 
   const recentSessions = await prisma.facilitySession.findMany({
-    where: facility === "SPORTS_ROOM" ? { facility_id: "__NONE__" } : sessionWhereClause,
+    where: sessionWhereClause,
     include: {
       student: true
     },
@@ -450,17 +652,20 @@ exports.getRecentEvents = async (limit = 50, facility = null) => {
     take: limit
   });
 
-  // Get recent equipment issues/returns
-  const recentIssues = await prisma.equipmentIssue.findMany({
-    include: {
-      student: true,
-      items: true
-    },
-    orderBy: {
-      issued_at: "desc"
-    },
-    take: limit
-  });
+  const includeEquipmentEvents = facility === "SPORTS_ROOM";
+
+  const recentIssues = includeEquipmentEvents
+    ? await prisma.equipmentIssue.findMany({
+        include: {
+          student: true,
+          items: true
+        },
+        orderBy: {
+          issued_at: "desc"
+        },
+        take: limit
+      })
+    : [];
 
   // Combine and format events
   const events = [];
@@ -492,7 +697,7 @@ exports.getRecentEvents = async (limit = 50, facility = null) => {
     }
   });
 
-  // Add equipment events
+  // Sport room equipment events (only when that facility is selected)
   recentIssues.forEach((issue) => {
     events.push({
       type: "EQUIPMENT_ISSUE",
@@ -534,11 +739,10 @@ exports.getRecentEvents = async (limit = 50, facility = null) => {
   // Sort by timestamp descending
   events.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-  // Apply facility filter for SPORTS_ROOM
   let filteredEvents = events;
   if (facility === "SPORTS_ROOM") {
-    filteredEvents = events.filter((e) => 
-      e.type === "EQUIPMENT_ISSUE" || e.type === "EQUIPMENT_RETURN"
+    filteredEvents = events.filter(
+      (e) => e.type === "EQUIPMENT_ISSUE" || e.type === "EQUIPMENT_RETURN"
     );
   }
 
@@ -552,7 +756,7 @@ exports.getRecentEvents = async (limit = 50, facility = null) => {
 /**
  * Get unmatched entries (entries without exits, older than X hours)
  */
-exports.getUnmatchedEntries = async (olderThanHours = 4) => {
+exports.getUnmatchedEntries = async (olderThanHours = 4, facilityIds = null) => {
   const cutoff = new Date();
   cutoff.setHours(cutoff.getHours() - olderThanHours);
 
@@ -561,7 +765,10 @@ exports.getUnmatchedEntries = async (olderThanHours = 4) => {
       exit_time: null,
       entry_time: {
         lt: cutoff
-      }
+      },
+      ...(Array.isArray(facilityIds) && facilityIds.length
+        ? { facility_id: { in: facilityIds } }
+        : {})
     },
     include: {
       student: true
@@ -640,6 +847,8 @@ exports.getExportData = async (facility, startDate, endDate, type = "events") =>
 
     if (facility && facility !== "ALL") {
       whereClause.facility_id = facility;
+    } else {
+      whereClause.facility_id = { in: ENTRY_EXIT_FACILITY_IDS };
     }
 
     const sessions = await prisma.facilitySession.findMany({

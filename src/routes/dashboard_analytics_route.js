@@ -85,6 +85,13 @@ router.get(
   dashboardController.getHeatmapData
 );
 
+router.get(
+  "/dashboard/analytics/footfall-summary",
+  authenticateAdmin,
+  authorizeRoles(ROLES.MANAGEMENT),
+  dashboardController.getFootfallAnalyticsSummary
+);
+
 // ============================================
 // EVENTS & TABLES (all except GUARD)
 // ============================================
