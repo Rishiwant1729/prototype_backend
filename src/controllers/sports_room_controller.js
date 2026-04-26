@@ -170,3 +170,23 @@ exports.getAvailableEquipment = async (req, res) => {
     });
   }
 };
+
+/**
+ * Get sports room equipment issue/return events for a date range
+ * GET /api/sports-room/recent?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&limit=800
+ */
+exports.getRecentEquipmentEvents = async (req, res) => {
+  try {
+    const { startDate, endDate, limit } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: "startDate and endDate are required" });
+    }
+
+    const nLimit = Math.min(2000, Math.max(1, Number(limit || 800)));
+    const result = await sportsRoomService.getRecentEquipmentEvents(startDate, endDate, nLimit);
+    return res.json(result);
+  } catch (err) {
+    console.error("Get sports room recent events error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+};

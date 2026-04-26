@@ -6,9 +6,25 @@ const jwt = require("jsonwebtoken");
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN;
 
+function dbErrorPayload(err) {
+  const msg = String(err?.message || "");
+  const short =
+    msg.includes("Authentication failed against database server") ||
+    msg.includes("Invalid `prisma.") ||
+    err?.name === "PrismaClientInitializationError"
+      ? "Database connection failed. Check DATABASE_URL / MySQL credentials."
+      : "Database unavailable.";
+  return { action: "DB_ERROR", reason: short };
+}
+
 exports.signup = async (name, email, password) => {
-  // Allow only ONE admin
-  const existingAdmin = await prisma.admin.findFirst();
+  let existingAdmin;
+  try {
+    // Allow only ONE admin
+    existingAdmin = await prisma.admin.findFirst();
+  } catch (err) {
+    return dbErrorPayload(err);
+  }
 
   if (existingAdmin) {
     return {
@@ -19,21 +35,30 @@ exports.signup = async (name, email, password) => {
 
   const passwordHash = await bcrypt.hash(password, 10);
 
-  await prisma.admin.create({
-    data: {
-      name,
-      email,
-      password_hash: passwordHash
-    }
-  });
+  try {
+    await prisma.admin.create({
+      data: {
+        name,
+        email,
+        password_hash: passwordHash
+      }
+    });
+  } catch (err) {
+    return dbErrorPayload(err);
+  }
 
   return { action: "ADMIN_CREATED" };
 };
 
 exports.login = async (email, password) => {
-  const admin = await prisma.admin.findUnique({
-    where: { email }
-  });
+  let admin;
+  try {
+    admin = await prisma.admin.findUnique({
+      where: { email }
+    });
+  } catch (err) {
+    return dbErrorPayload(err);
+  }
 
   if (!admin) {
     return { action: "REJECTED", reason: "Invalid credentials" };

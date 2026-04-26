@@ -20,4 +20,8 @@ router.get("/sports-room/missing", authenticateAdmin, sportsRoomController.getMi
 // GET /api/sports-room/equipment
 router.get("/sports-room/equipment", authenticateAdmin, sportsRoomController.getAvailableEquipment);
 
+// Get equipment issue/return events by date range
+// GET /api/sports-room/recent
+router.get("/sports-room/recent", authenticateAdmin, sportsRoomController.getRecentEquipmentEvents);
+
 module.exports = router;

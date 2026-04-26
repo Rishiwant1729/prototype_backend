@@ -459,3 +459,76 @@ exports.getMissingEquipment = async () => {
 
   return missingItems;
 };
+
+/**
+ * Get recent equipment issue/return events within a date range.
+ * - Includes ISSUED events when issued_at is in range
+ * - Includes RETURNED events when returned_at is in range
+ *
+ * @param {string} startDate YYYY-MM-DD
+ * @param {string} endDate YYYY-MM-DD
+ * @param {number} limit max events (soft)
+ */
+exports.getRecentEquipmentEvents = async (startDate, endDate, limit = 800) => {
+  const start = new Date(`${startDate}T00:00:00`);
+  const end = new Date(`${endDate}T23:59:59`);
+
+  const issues = await prisma.equipmentIssue.findMany({
+    where: {
+      OR: [
+        { issued_at: { gte: start, lte: end } },
+        { returned_at: { gte: start, lte: end } }
+      ]
+    },
+    include: {
+      items: true,
+      student: true
+    },
+    orderBy: {
+      issued_at: "desc"
+    },
+    take: Math.min(2000, Math.max(1, Number(limit || 800)))
+  });
+
+  const events = [];
+  for (const issue of issues) {
+    const base = {
+      issue_id: issue.issue_id,
+      student_id: issue.student_id,
+      student_name: issue.student_name,
+      student: issue.student
+        ? { student_id: issue.student.student_id, student_name: issue.student.student_name }
+        : { student_id: issue.student_id, student_name: issue.student_name },
+      items: (issue.items || []).map((it) => ({
+        item_id: it.item_id,
+        equipment_type: it.equipment_type,
+        issued_qty: it.issued_qty,
+        returned_qty: it.returned_qty || 0
+      }))
+    };
+
+    if (issue.issued_at && issue.issued_at >= start && issue.issued_at <= end) {
+      events.push({
+        ...base,
+        action: "EQUIPMENT_ISSUED",
+        issued_at: issue.issued_at,
+        timestamp: issue.issued_at,
+        returned: false
+      });
+    }
+
+    if (issue.returned_at && issue.returned_at >= start && issue.returned_at <= end) {
+      events.push({
+        ...base,
+        action: "EQUIPMENT_RETURNED",
+        issued_at: issue.returned_at,
+        timestamp: issue.returned_at,
+        returned: true
+      });
+    }
+  }
+
+  // Sort by timestamp desc and cap
+  events.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  return events.slice(0, Math.min(2000, Math.max(1, Number(limit || 800))));
+};

@@ -139,9 +139,12 @@ exports.getActiveEquipmentIssues = async () => {
     }, 0);
   }, 0);
 
+  const uniqueStudents = new Set(activeIssues.map((i) => i.student_id)).size;
+
   return {
     active_issues: activeIssues.length,
     total_pending_items: totalItems,
+    unique_students: uniqueStudents,
     issues: activeIssues.map((issue) => ({
       issue_id: issue.issue_id,
       student_id: issue.student_id,
@@ -524,8 +527,11 @@ exports.getFootfallAnalyticsSummary = async (facility, startDate, endDate) => {
     total_exits,
     uniqueVisitorsRows,
     entryTimesOnly,
+    sessionsForPeak,
     byFacility,
     durationRows,
+    repeatVisitorsRows,
+    missingExitsRows,
     prev_total_entries
   ] = await Promise.all([
     prisma.facilitySession.count({ where: entryWhere }),
@@ -538,6 +544,10 @@ exports.getFootfallAnalyticsSummary = async (facility, startDate, endDate) => {
     prisma.facilitySession.findMany({
       where: entryWhere,
       select: { entry_time: true }
+    }),
+    prisma.facilitySession.findMany({
+      where: entryWhere,
+      select: { entry_time: true, exit_time: true }
     }),
     prisma.facilitySession.groupBy({
       by: ["facility_id"],
@@ -552,10 +562,32 @@ exports.getFootfallAnalyticsSummary = async (facility, startDate, endDate) => {
       },
       select: { entry_time: true, duration_minutes: true }
     }),
+    prisma.facilitySession.groupBy({
+      by: ["student_id"],
+      where: entryWhere,
+      _count: { session_id: true },
+      having: {
+        session_id: {
+          _count: {
+            gt: 1
+          }
+        }
+      }
+    }),
+    prisma.facilitySession.findMany({
+      where: {
+        ...fac,
+        exit_time: null,
+        entry_time: { gte: start, lte: end }
+      },
+      select: { entry_time: true }
+    }),
     prisma.facilitySession.count({ where: prevEntryWhere })
   ]);
 
   const unique_visitors = uniqueVisitorsRows.length;
+  const repeat_visitors = Array.isArray(repeatVisitorsRows) ? repeatVisitorsRows.length : 0;
+  const new_visitors = Math.max(0, unique_visitors - repeat_visitors);
 
   const hourCounts = Array(24).fill(0);
   entryTimesOnly.forEach((s) => {
@@ -574,6 +606,46 @@ exports.getFootfallAnalyticsSummary = async (facility, startDate, endDate) => {
           durationRows.reduce((sum, s) => sum + (Number(s.duration_minutes) || 0), 0) /
             durationRows.length
         );
+
+  // Stay duration distribution (minutes) — analytics-friendly bins
+  const duration_bins = [
+    { label: "0–15m", min: 0, max: 15 },
+    { label: "15–30m", min: 15, max: 30 },
+    { label: "30–60m", min: 30, max: 60 },
+    { label: "60–90m", min: 60, max: 90 },
+    { label: "90m+", min: 90, max: Infinity }
+  ];
+  const duration_distribution = duration_bins.map((b) => ({ label: b.label, count: 0 }));
+  durationRows.forEach((s) => {
+    const m = Number(s.duration_minutes);
+    if (!Number.isFinite(m) || m < 0) return;
+    const idx = duration_bins.findIndex((b) => m >= b.min && m < b.max);
+    if (idx >= 0) duration_distribution[idx].count += 1;
+  });
+
+  // Peak occupancy (within selected range; based on in-range sessions)
+  const events = [];
+  sessionsForPeak.forEach((s) => {
+    if (s.entry_time) events.push({ t: new Date(s.entry_time).getTime(), d: +1 });
+    if (s.exit_time) events.push({ t: new Date(s.exit_time).getTime(), d: -1 });
+  });
+  events.sort((a, b) => (a.t === b.t ? b.d - a.d : a.t - b.t));
+  let occ = 0;
+  let peak_occupancy = 0;
+  let peak_occupancy_at = null;
+  events.forEach((e) => {
+    occ += e.d;
+    if (occ > peak_occupancy) {
+      peak_occupancy = occ;
+      peak_occupancy_at = new Date(e.t).toISOString();
+    }
+  });
+
+  // Entry/exit consistency: missing exits older than 4h at end of range
+  const endMinus4h = new Date(end.getTime() - 4 * 60 * 60 * 1000);
+  const missing_exits_over_4h = (missingExitsRows || []).filter(
+    (r) => new Date(r.entry_time) <= endMinus4h
+  ).length;
 
   const totalEntryShare = byFacility.reduce((s, b) => s + b._count.session_id, 0);
   const facility_share = byFacility
@@ -612,13 +684,19 @@ exports.getFootfallAnalyticsSummary = async (facility, startDate, endDate) => {
       total_entries,
       total_exits,
       unique_visitors,
+      repeat_visitors,
+      new_visitors,
       peak_hour_label,
       peak_hour_count,
       avg_session_minutes,
+      peak_occupancy,
+      peak_occupancy_at,
+      missing_exits_over_4h,
       entries_growth_pct
     },
     facility_share,
-    daily_avg_duration
+    daily_avg_duration,
+    duration_distribution
   };
 };
 
