@@ -15,27 +15,40 @@ const dashboardAnalyticsRoutes = require("./routes/dashboard_analytics_route");
 
 const app = express();
 
-// app.use(
-//   cors({
-//     origin: [
-//       "http://localhost:5173",
-//       "http://10.7.9.130:5173"
-//     ],
-//     credentials: true
-//   })
-// );
+function getAllowedOrigins() {
+  // Comma-separated list, e.g.
+  // CORS_ORIGINS="https://my-frontend.vercel.app,http://localhost:5173"
+  const fromEnv = process.env.CORS_ORIGINS;
+  const envOrigins = fromEnv
+    ? fromEnv
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
 
+  // Reasonable defaults for local dev + the currently deployed Vercel URL.
+  const defaults = [
+    "https://prototype-frontend-brown.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+  ];
 
+  return Array.from(new Set([...defaults, ...envOrigins]));
+}
+
+const allowedOrigins = getAllowedOrigins();
 app.use(
   cors({
-    origin: [
-      "http://localhost:5173",
-      "http://localhost:5174",
-      "http://localhost:5175",
-      "http://127.0.0.1:5173",
-      "http://127.0.0.1:5174"
-    ],
-    credentials: true
+    origin(origin, cb) {
+      // Allow non-browser requests (no Origin header), like curl/healthchecks.
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true,
   })
 );
 app.use(express.json());
