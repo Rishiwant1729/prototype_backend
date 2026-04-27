@@ -15,6 +15,15 @@ const dashboardAnalyticsRoutes = require("./routes/dashboard_analytics_route");
 
 const app = express();
 
+function isVercelPreviewOrigin(origin) {
+  try {
+    const { hostname } = new URL(origin);
+    return hostname.endsWith(".vercel.app");
+  } catch {
+    return false;
+  }
+}
+
 function getAllowedOrigins() {
   // Comma-separated list, e.g.
   // CORS_ORIGINS="https://my-frontend.vercel.app,http://localhost:5173"
@@ -40,18 +49,25 @@ function getAllowedOrigins() {
 }
 
 const allowedOrigins = getAllowedOrigins();
-app.use(
-  cors({
-    origin(origin, cb) {
-      // Allow non-browser requests (no Origin header), like curl/healthchecks.
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked for origin: ${origin}`));
-    },
-    credentials: true,
-  })
-);
+const corsOptions = {
+  origin(origin, cb) {
+    // Allow non-browser requests (no Origin header), like curl/healthchecks.
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (isVercelPreviewOrigin(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+};
+
+// Handle preflight explicitly (avoids odd proxy/edge behaviors).
+app.options("*", cors(corsOptions));
+app.use(cors(corsOptions));
 app.use(express.json());
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
 
 
 app.use("/api", scanRoutes);
